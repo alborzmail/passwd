@@ -93,7 +93,7 @@ func run(args []string, logger *log.Logger) error {
 		file.Hasher = dove
 		backend, what = &file, file.Path
 	case sqlConf != "":
-		db, err := OpenSQL(sqlConf, dove, file.DefaultScheme)
+		db, err := OpenSQL(sqlConf, dove, dove.Scheme, file.DefaultScheme)
 		if err != nil {
 			return fmt.Errorf("%s: %v", sqlConf, err)
 		}

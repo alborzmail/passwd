@@ -51,8 +51,9 @@ type part struct {
 	filters []string
 }
 
-// short are Dovecot 2.3's variables in 2.4's syntax.
-var short = map[byte]string{'u': "user", 'n': "user|username", 'd': "user|domain", 'p': "hash"}
+// short are Dovecot 2.3's variables in 2.4's syntax, and %h, which Dovecot does not have.
+var short = map[byte]string{'u': "user", 'n': "user|username", 'd': "user|domain", 'p': "hash",
+	'h': "hash|noscheme"}
 
 // long are the names %{...} takes: 2.4's user, 2.3's username and domain, and hash.
 var long = map[string]string{"user": "user", "username": "user|username", "domain": "user|domain",
@@ -70,6 +71,9 @@ var filters = map[string]struct {
 	"domain":   {"user", func(s string) string { _, domain, _ := strings.Cut(s, "@"); return domain }},
 	"lower":    {"user", strings.ToLower},
 	"upper":    {"user", strings.ToUpper},
+	// noscheme leaves the hash bare, for a database that keeps the scheme in the passdb's
+	// default_password_scheme.
+	"noscheme": {"hash", func(s string) string { _, bare, _ := strings.Cut(s, "}"); return bare }},
 }
 
 func ParseQuery(query string, bind func(i int) string) (Query, error) {
@@ -157,7 +161,7 @@ func variable(s string) (part, int, error) {
 		p, err := expand(short[s[1]])
 		return p, 2, err
 	}
-	return part{}, 0, fmt.Errorf("%.3s: the variables are %%u, %%n, %%d, %%p and %%{user|filter}", s)
+	return part{}, 0, fmt.Errorf("%.3s: the variables are %%u, %%n, %%d, %%p, %%h and %%{user|filter}", s)
 }
 
 // expand reads a name and its filters, as in user | username | lower.
@@ -202,6 +206,13 @@ func (q Query) args(user, hash string) []any {
 	return args
 }
 
+// bare tells whether the query stores the hash without its {SCHEME} prefix.
+func (q Query) bare() bool {
+	return slices.ContainsFunc(q.params, func(parts []part) bool {
+		return slices.ContainsFunc(parts, func(p part) bool { return slices.Contains(p.filters, "noscheme") })
+	})
+}
+
 func (q Query) uses(name string) bool {
 	return slices.ContainsFunc(q.params, func(parts []part) bool {
 		return slices.ContainsFunc(parts, func(p part) bool { return p.name == name })
@@ -209,8 +220,8 @@ func (q Query) uses(name string) bool {
 }
 
 // OpenSQL reads a file of driver, dsn, select and update lines, each "key = value", and
-// connects to the database.
-func OpenSQL(path string, h Hasher, defaultScheme string) (*SQL, error) {
+// connects to the database. scheme is the one h hashes with.
+func OpenSQL(path string, h Hasher, scheme, defaultScheme string) (*SQL, error) {
 	conf, err := readConf(path, "driver", "dsn", "select", "update")
 	if err != nil {
 		return nil, err
@@ -231,6 +242,10 @@ func OpenSQL(path string, h Hasher, defaultScheme string) (*SQL, error) {
 	}
 	if !s.Update.uses("user") || !s.Update.uses("hash") {
 		return nil, errors.New("update: name the user, as %u or %{user}, and the hash, as %p")
+	}
+	if s.Update.bare() && scheme != defaultScheme {
+		return nil, fmt.Errorf("update: a bare hash of %s would be read as %s: -scheme and -default-scheme differ",
+			scheme, defaultScheme)
 	}
 	if !slices.Contains(sql.Drivers(), driver.name) {
 		return nil, fmt.Errorf("driver %q is not built in: build with -tags %s", conf["driver"], conf["driver"])

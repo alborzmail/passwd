@@ -22,6 +22,7 @@ func TestParseQuery(t *testing.T) {
 			"WHERE n = $1 AND d = $2 AND u = $3", "[Alice example.org Alice@Example.org]"},
 		{"WHERE u = '%Lu' AND n = %Un AND d = %{domain} AND h = %{hash}",
 			"WHERE u = $1 AND n = $2 AND d = $3 AND h = $4", "[alice@example.org ALICE Example.org {X}h]"},
+		{"SET p = %h, q = '%{hash | noscheme}'", "SET p = $1, q = $2", "[h h]"},
 		{"SELECT '/var/vmail/%d/%n' AS home, 'it''s %n' AS s, 7 %% 2 WHERE u LIKE '%%%u'",
 			"SELECT $1 AS home, $2 AS s, 7 % 2 WHERE u LIKE $3", "[/var/vmail/Example.org/Alice it's Alice %Alice@Example.org]"},
 	} {
@@ -130,7 +131,7 @@ func openSQL(t *testing.T, db testDB, sel, update string) (*SQL, *sql.DB, error)
 	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	backend, err := OpenSQL(path, testHasher{}, "TEST")
+	backend, err := OpenSQL(path, testHasher{}, "TEST", "TEST")
 	return backend, conn, err
 }
 
@@ -225,7 +226,7 @@ func TestSQLConfRefused(t *testing.T) {
 		if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenSQL(path, testHasher{}, "TEST"); err == nil {
+		if _, err := OpenSQL(path, testHasher{}, "TEST", "TEST"); err == nil {
 			t.Errorf("%s: taken", name)
 		} else {
 			t.Logf("%s: %v", name, err)
@@ -305,5 +306,36 @@ func TestSQLDovecotQueries(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSQLBareHash(t *testing.T) {
+	for _, db := range testDBs(t) {
+		t.Run(db.driver, func(t *testing.T) {
+			s, conn := setupSQL(t, db, oneSelect, "UPDATE users SET password = %h WHERE username = %n AND domain = %d")
+			before := stored(t, conn)
+			if !changed(t, s, "alice@example.org", "old-secret") {
+				t.Fatal("not changed")
+			}
+			want := slices.Clone(before)
+			want[1][2] = strings.TrimPrefix(hashed("fresh secret"), "{TEST}")
+			if after := stored(t, conn); !slices.Equal(after, want) {
+				t.Errorf("rows %q, want %q", after, want)
+			}
+			// The bare hash is read back under -default-scheme.
+			if ok, err := s.Backend.Verify("alice@example.org", "fresh secret"); !ok || err != nil {
+				t.Errorf("verify: %v, %v", ok, err)
+			}
+		})
+	}
+	path := filepath.Join(t.TempDir(), "sql.conf")
+	conf := "driver = sqlite\ndsn = x\nselect = SELECT password FROM users WHERE u = %u\nupdate = UPDATE users SET password = %{hash | noscheme} WHERE u = %u\n"
+	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenSQL(path, testHasher{}, "SHA512-CRYPT", "TEST"); err == nil {
+		t.Error("a bare hash of another scheme than the default taken")
+	} else {
+		t.Log(err)
 	}
 }
