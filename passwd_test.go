@@ -167,3 +167,17 @@ func TestDoveadm(t *testing.T) {
 		t.Error("a hash without a scheme verified without an error")
 	}
 }
+
+func TestListensOnLoopbackOnly(t *testing.T) {
+	for ip, want := range map[string]bool{
+		"127.0.0.1": true, "127.1.2.3": true, "::1": true, "::ffff:127.0.0.1": true,
+		"0.0.0.0": false, "::": false, "192.0.2.1": false, "::ffff:192.0.2.1": false, "fe80::1": false,
+	} {
+		if got := loopback(&net.TCPAddr{IP: net.ParseIP(ip), Port: 106}) == nil; got != want {
+			t.Errorf("%s taken %v, want %v", ip, got, want)
+		}
+	}
+	if err := loopback(&net.UnixAddr{Name: "/run/alborz-passwd.sock", Net: "unix"}); err != nil {
+		t.Error(err)
+	}
+}

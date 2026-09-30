@@ -44,13 +44,15 @@ socket:
 Flags: `-passwd-file` (required), `-scheme` (new hashes, default
 `SHA512-CRYPT`), `-default-scheme` (for hashes without a `{SCHEME}`
 prefix, default `CRYPT`), `-min-length` (default 8), `-doveadm`,
-`-listen` (`unix:/path` or `host:port`; unset takes the socket systemd
-passes).
+`-listen` (`unix:/path` or a loopback `host:port`; unset takes the
+socket systemd passes).
 
 ## Security notes
 
-- The protocol is plain text. The socket unit lets only the `alborz`
-  group connect; do not expose a TCP port beyond loopback.
+- The protocol is plain text, so the service listens only on a Unix
+  socket or a loopback address (127.0.0.0/8, ::1) and refuses to start
+  on any other. The socket unit lets only the `alborz` group connect; a
+  loopback port is open to every local user.
 - `doveadm pw -t` takes the stored hash as an argument. The unit hides
   the service's processes from other users (`ProtectProc=invisible`).
 - The service needs to write the passwd-file's directory and

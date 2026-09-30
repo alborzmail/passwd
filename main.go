@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,7 +41,7 @@ func run(args []string, logger *log.Logger) error {
 		minLen int
 	)
 	fs.StringVar(&listen, "listen", "",
-		"unix:/path or host:port to listen on; unset takes the socket systemd passes")
+		"unix:/path or a loopback host:port to listen on; unset takes the socket systemd passes")
 	fs.StringVar(&file.Path, "passwd-file", "", "the Dovecot passwd-file whose passwords change; required")
 	fs.StringVar(&file.DefaultScheme, "default-scheme", "CRYPT",
 		"the passdb's default_password_scheme, for a password in the file without a {SCHEME} prefix")
@@ -71,6 +72,10 @@ func run(args []string, logger *log.Logger) error {
 	if err != nil {
 		return err
 	}
+	if err := loopback(ln.Addr()); err != nil {
+		ln.Close()
+		return err
+	}
 	logger.Printf("alborz-passwd: serving %s on %s", file.Path, ln.Addr())
 	s := &Server{Backend: &file, Limit: NewLimiter(failedTries, failedWindow), MinLength: minLen,
 		Log: logger, delay: refusalDelay}
@@ -98,4 +103,19 @@ func listener(listen string) (net.Listener, error) {
 		return nil, fmt.Errorf("the socket systemd passed: %v", err)
 	}
 	return ln, nil
+}
+
+// loopback refuses an address beyond this host: poppassd carries passwords in plain text.
+func loopback(addr net.Addr) error {
+	if addr.Network() == "unix" {
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(addr.String())
+	if err != nil {
+		return err
+	}
+	if !ap.Addr().Unmap().IsLoopback() {
+		return fmt.Errorf("%s is not a Unix socket or a loopback address: poppassd is plain text", addr)
+	}
+	return nil
 }
