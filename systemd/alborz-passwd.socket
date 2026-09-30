@@ -1,0 +1,11 @@
+[Unit]
+Description=alborz password changes (poppassd)
+
+[Socket]
+ListenStream=/run/alborz-passwd.sock
+# Only alborz's group may connect.
+SocketGroup=alborz
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
