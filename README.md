@@ -5,15 +5,23 @@ NEWPASS, QUIT), for [alborz](https://github.com/alborzmail) or any other
 poppassd client on the mail host. The web application never touches the
 user database; this small service does, with least privilege.
 
-Backend: a Dovecot passwd-file. SQL and LDAP may follow.
+Backends: a Dovecot passwd-file (`-passwd-file`) or the database of
+Dovecot's SQL passdb (`-sql`). LDAP is not supported.
 
 ## How it works
 
-- `doveadm pw -t` verifies the current password against the user's line,
-  and `doveadm pw -s` hashes the new one, which is verified again before
-  it is written. Every scheme Dovecot knows is handled by Dovecot's own
-  code; passwords reach doveadm on standard input, never the command
+- `doveadm pw -t` verifies the current password against the stored
+  hash, and `doveadm pw -s` hashes the new one, which is verified again
+  before it is stored. Every scheme Dovecot knows is handled by Dovecot's
+  own code; passwords reach doveadm on standard input, never the command
   line. Plaintext schemes are refused.
+- A wrong password and an unknown user get the same answer, after three
+  seconds. Five failures within ten minutes pause the user (fail2ban's
+  defaults); the count is in memory and a restart clears it.
+- At most 16 conversations at once, each bounded to 30 seconds.
+
+### passwd-file
+
 - The file is replaced atomically: the new content goes to a file beside
   it, with the old file's mode, owner and group, and is renamed over it.
   Only the password field of the one user changes. Writers are serialised
@@ -21,14 +29,45 @@ Backend: a Dovecot passwd-file. SQL and LDAP may follow.
   `flock(1)`.
 - The current password is checked again under the lock, so a change
   made in between is not overwritten.
-- A wrong password and an unknown user get the same answer, after three
-  seconds. Five failures within ten minutes pause the user (fail2ban's
-  defaults); the count is in memory and a restart clears it.
-- At most 16 conversations at once, each bounded to 30 seconds.
+
+### SQL
+
+`-sql /etc/dovecot/passwd.sql` names a file, readable by the service
+only, since it holds the database password:
+
+    # pgsql (PostgreSQL), mysql (MySQL, MariaDB) or sqlite
+    driver = pgsql
+    dsn = host=/run/postgresql dbname=mail user=passwd
+    select = SELECT password FROM users WHERE userid = %n AND domain = %d FOR UPDATE
+    update = UPDATE users SET password = %p WHERE userid = %n AND domain = %d
+
+- `select` returns the one column holding the user's hash, in one row;
+  none is an unknown user, two are an error. A hash without a `{SCHEME}`
+  prefix takes `-default-scheme`.
+- The variables are bound as parameters, never pasted into the SQL, so
+  they stand unquoted: `%u` the user as alborz sends it
+  (`%{user}` in Dovecot 2.4), `%n` its local part (`%{user|username}`),
+  `%d` its domain (`%{user|domain}`), and `%p`, in `update` only, the new
+  hash with its `{SCHEME}` prefix. No other `%` is taken.
+- The select, the check of the current password and the update run in
+  one transaction; an update changing anything but one row is rolled
+  back. `FOR UPDATE` keeps another writer out in between on PostgreSQL
+  and MySQL; on SQLite, add `_txlock=immediate` to the DSN
+  (`file:/var/lib/dovecot/users.db?_txlock=immediate`).
+- The DSN is the Go driver's: [pgx](https://github.com/jackc/pgx)
+  takes libpq's `key=value` and URLs, so Dovecot's `connect` line for
+  pgsql works as it is;
+  [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql#dsn-data-source-name)
+  takes `user:password@unix(/run/mysqld/mysqld.sock)/mail`;
+  [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) a path or
+  `file:` URI.
+- Each driver is built in only on request, with its name as the build
+  tag: `go build -tags pgsql .`. Without a tag the binary has no
+  dependency beyond Go's standard library.
 
 ## Install
 
-    go build -o /usr/local/sbin/alborz-passwd .
+    go build -o /usr/local/sbin/alborz-passwd .   # -tags pgsql, mysql or sqlite for -sql
     useradd --system --no-create-home --gid dovecot alborz-passwd
     groupadd --system alborz          # the group alborz runs in
     install -d -o alborz-passwd -g dovecot -m 0750 /etc/dovecot/passwd.d
@@ -41,7 +80,12 @@ socket:
 
     alborz example.org example.org=poppassd+unix:///run/alborz-passwd.sock
 
-Flags: `-passwd-file` (required), `-scheme` (new hashes, default
+The unit serves a passwd-file. For `-sql`, give the unit `-sql` in
+`ExecStart`; the file's directory and `CAP_CHOWN` are then not needed,
+and a database reached over TCP needs `PrivateNetwork`,
+`RestrictAddressFamilies` and `IPAddressDeny` loosened.
+
+Flags: `-passwd-file` or `-sql` (one is required), `-scheme` (new hashes, default
 `SHA512-CRYPT`), `-default-scheme` (for hashes without a `{SCHEME}`
 prefix, default `CRYPT`), `-min-length` (default 8), `-doveadm`,
 `-listen` (`unix:/path` or a loopback `host:port`; unset takes the
@@ -55,7 +99,7 @@ socket systemd passes).
   loopback port is open to every local user.
 - `doveadm pw -t` takes the stored hash as an argument. The unit hides
   the service's processes from other users (`ProtectProc=invisible`).
-- The service needs to write the passwd-file's directory and
+- A passwd-file service needs to write the file's directory and
   `CAP_CHOWN` to keep the file's owner; the unit grants nothing else.
 - With Dovecot's `auth_cache_size` set, the old password keeps working
   until its cache entry expires: flush it with
@@ -66,6 +110,9 @@ socket systemd passes).
 ## Test
 
     go test ./...
+    # SQL: SQLite in process, PostgreSQL and MySQL where a DSN is given:
+    PGSQL_DSN=postgres://... MYSQL_DSN='user:pw@tcp(127.0.0.1:3306)/db' \
+      go test -tags pgsql,mysql,sqlite ./...
     # doveadm against a real Dovecot:
     GOOS=linux go test -c -o passwd.test . &&
       docker run --rm -v $PWD/passwd.test:/t:ro -e DOVEADM=/dovecot/bin/doveadm \

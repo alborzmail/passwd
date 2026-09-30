@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,11 +42,12 @@ func field(data []byte, user string) (start, end int) {
 	return -1, -1
 }
 
-func (f *PasswdFile) prefixed(hash string) string {
+// prefixed gives a stored hash without a {SCHEME} prefix the passdb's default scheme.
+func prefixed(hash, scheme string) string {
 	if strings.HasPrefix(hash, "{") {
 		return hash
 	}
-	return "{" + f.DefaultScheme + "}" + hash
+	return "{" + scheme + "}" + hash
 }
 
 func (f *PasswdFile) Verify(user, password string) (bool, error) {
@@ -59,16 +59,13 @@ func (f *PasswdFile) Verify(user, password string) (bool, error) {
 	if start < 0 {
 		return false, nil
 	}
-	return f.Hasher.Verify(f.prefixed(string(data[start:end])), password)
+	return f.Hasher.Verify(prefixed(string(data[start:end]), f.DefaultScheme), password)
 }
 
 func (f *PasswdFile) Change(user, current, next string) error {
-	hash, err := f.Hasher.Hash(next)
+	hash, err := verifiedHash(f.Hasher, next)
 	if err != nil {
 		return err
-	}
-	if ok, err := f.Hasher.Verify(hash, next); err != nil || !ok {
-		return fmt.Errorf("the new hash does not verify: %v", err)
 	}
 
 	f.mu.Lock()
@@ -88,7 +85,7 @@ func (f *PasswdFile) Change(user, current, next string) error {
 		return ErrRefused
 	}
 	// The file may have changed since PASS was answered.
-	if ok, err := f.Hasher.Verify(f.prefixed(string(data[start:end])), current); err != nil {
+	if ok, err := f.Hasher.Verify(prefixed(string(data[start:end]), f.DefaultScheme), current); err != nil {
 		return err
 	} else if !ok {
 		return ErrRefused

@@ -86,3 +86,15 @@ func (d Doveadm) run(stdin string, args ...string) (string, error) {
 	}
 	return stdout.String(), nil
 }
+
+// verifiedHash hashes password and verifies the hash, before anything stores it.
+func verifiedHash(h Hasher, password string) (string, error) {
+	hash, err := h.Hash(password)
+	if err != nil {
+		return "", err
+	}
+	if ok, err := h.Verify(hash, password); err != nil || !ok {
+		return "", fmt.Errorf("the new hash does not verify: %v", err)
+	}
+	return hash, nil
+}

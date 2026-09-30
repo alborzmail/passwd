@@ -35,38 +35,53 @@ func main() {
 func run(args []string, logger *log.Logger) error {
 	fs := flag.NewFlagSet("alborz-passwd", flag.ContinueOnError)
 	var (
-		listen string
-		file   PasswdFile
-		dove   Doveadm
-		minLen int
+		listen  string
+		file    PasswdFile
+		sqlConf string
+		dove    Doveadm
+		minLen  int
 	)
 	fs.StringVar(&listen, "listen", "",
 		"unix:/path or a loopback host:port to listen on; unset takes the socket systemd passes")
-	fs.StringVar(&file.Path, "passwd-file", "", "the Dovecot passwd-file whose passwords change; required")
+	fs.StringVar(&file.Path, "passwd-file", "", "the Dovecot passwd-file whose passwords change")
+	fs.StringVar(&sqlConf, "sql", "", "the file naming the SQL database and its queries")
 	fs.StringVar(&file.DefaultScheme, "default-scheme", "CRYPT",
-		"the passdb's default_password_scheme, for a password in the file without a {SCHEME} prefix")
+		"the passdb's default_password_scheme, for a stored password without a {SCHEME} prefix")
 	fs.StringVar(&dove.Path, "doveadm", "doveadm", "the doveadm that verifies and makes hashes")
 	fs.StringVar(&dove.Scheme, "scheme", "SHA512-CRYPT", "the scheme a new password is hashed with")
 	fs.IntVar(&minLen, "min-length", 8, "the fewest characters a new password may have")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if file.Path == "" {
-		return errors.New("-passwd-file is required")
-	}
-	// The file is replaced, not written, so a symlink would be replaced by a file.
-	real, err := filepath.EvalSymlinks(file.Path)
-	if err != nil {
-		return err
-	}
-	file.Path = real
-	if _, err := os.ReadFile(file.Path); err != nil {
-		return err
+	if (file.Path == "") == (sqlConf == "") {
+		return errors.New("give one of -passwd-file and -sql")
 	}
 	if err := dove.Check(); err != nil {
 		return err
 	}
-	file.Hasher = dove
+	var (
+		backend Backend
+		what    string
+	)
+	if file.Path != "" {
+		// The file is replaced, not written, so a symlink would be replaced by a file.
+		real, err := filepath.EvalSymlinks(file.Path)
+		if err != nil {
+			return err
+		}
+		file.Path = real
+		if _, err := os.ReadFile(file.Path); err != nil {
+			return err
+		}
+		file.Hasher = dove
+		backend, what = &file, file.Path
+	} else {
+		db, err := OpenSQL(sqlConf, dove, file.DefaultScheme)
+		if err != nil {
+			return fmt.Errorf("%s: %v", sqlConf, err)
+		}
+		backend, what = db, sqlConf
+	}
 
 	ln, err := listener(listen)
 	if err != nil {
@@ -76,8 +91,8 @@ func run(args []string, logger *log.Logger) error {
 		ln.Close()
 		return err
 	}
-	logger.Printf("alborz-passwd: serving %s on %s", file.Path, ln.Addr())
-	s := &Server{Backend: &file, Limit: NewLimiter(failedTries, failedWindow), MinLength: minLen,
+	logger.Printf("alborz-passwd: serving %s on %s", what, ln.Addr())
+	s := &Server{Backend: backend, Limit: NewLimiter(failedTries, failedWindow), MinLength: minLen,
 		Log: logger, delay: refusalDelay}
 	return s.Serve(ln, sessions)
 }
