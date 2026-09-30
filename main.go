@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ func run(args []string, logger *log.Logger) error {
 		listen  string
 		file    PasswdFile
 		sqlConf string
+		pw      Pw
 		dove    Doveadm
 		minLen  int
 	)
@@ -45,6 +47,12 @@ func run(args []string, logger *log.Logger) error {
 		"unix:/path or a loopback host:port to listen on; unset takes the socket systemd passes")
 	fs.StringVar(&file.Path, "passwd-file", "", "the Dovecot passwd-file whose passwords change")
 	fs.StringVar(&sqlConf, "sql", "", "the file naming the SQL database and its queries")
+	fs.StringVar(&pw.Path, "pw", "", "FreeBSD's pw(8), to change system users' passwords")
+	// Dovecot's base_dir defaults to /var/run/dovecot.
+	fs.StringVar(&pw.Auth.Socket, "auth-socket", "/var/run/dovecot/auth-client",
+		"Dovecot's auth-client socket, which verifies the current password for -pw")
+	fs.StringVar(&pw.Auth.Service, "auth-service", "imap",
+		"the protocol Dovecot's passdb sees the -pw verification come from")
 	fs.StringVar(&file.DefaultScheme, "default-scheme", "CRYPT",
 		"the passdb's default_password_scheme, for a stored password without a {SCHEME} prefix")
 	fs.StringVar(&dove.Path, "doveadm", "doveadm", "the doveadm that verifies and makes hashes")
@@ -53,17 +61,26 @@ func run(args []string, logger *log.Logger) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if (file.Path == "") == (sqlConf == "") {
-		return errors.New("give one of -passwd-file and -sql")
+	given := 0
+	for _, f := range []string{file.Path, sqlConf, pw.Path} {
+		if f != "" {
+			given++
+		}
 	}
-	if err := dove.Check(); err != nil {
-		return err
+	if given != 1 {
+		return errors.New("give one of -passwd-file, -sql and -pw")
+	}
+	if pw.Path == "" {
+		if err := dove.Check(); err != nil {
+			return err
+		}
 	}
 	var (
 		backend Backend
 		what    string
 	)
-	if file.Path != "" {
+	switch {
+	case file.Path != "":
 		// The file is replaced, not written, so a symlink would be replaced by a file.
 		real, err := filepath.EvalSymlinks(file.Path)
 		if err != nil {
@@ -75,12 +92,20 @@ func run(args []string, logger *log.Logger) error {
 		}
 		file.Hasher = dove
 		backend, what = &file, file.Path
-	} else {
+	case sqlConf != "":
 		db, err := OpenSQL(sqlConf, dove, file.DefaultScheme)
 		if err != nil {
 			return fmt.Errorf("%s: %v", sqlConf, err)
 		}
 		backend, what = db, sqlConf
+	default:
+		if _, err := exec.LookPath(pw.Path); err != nil {
+			return err
+		}
+		if err := pw.Auth.Check(); err != nil {
+			return err
+		}
+		backend, what = pw, "system users"
 	}
 
 	ln, err := listener(listen)

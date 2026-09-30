@@ -5,13 +5,14 @@ NEWPASS, QUIT), for [alborz](https://github.com/alborzmail) or any other
 poppassd client on the mail host. The web application never touches the
 user database; this small service does, with least privilege.
 
-Backends: a Dovecot passwd-file (`-passwd-file`) or the database of
-Dovecot's SQL passdb (`-sql`). LDAP is not supported.
+Backends: a Dovecot passwd-file (`-passwd-file`), the database of
+Dovecot's SQL passdb (`-sql`), or FreeBSD's system users (`-pw`). LDAP,
+OpenBSD and NetBSD are not supported.
 
 ## How it works
 
-- `doveadm pw -t` verifies the current password against the stored
-  hash, and `doveadm pw -s` hashes the new one, which is verified again
+- For a passwd-file and SQL, `doveadm pw -t` verifies the current
+  password against the stored hash, and `doveadm pw -s` hashes the new one, which is verified again
   before it is stored. Every scheme Dovecot knows is handled by Dovecot's
   own code; passwords reach doveadm on standard input, never the command
   line. Plaintext schemes are refused.
@@ -65,6 +66,31 @@ only, since it holds the database password:
   tag: `go build -tags pgsql .`. Without a tag the binary has no
   dependency beyond Go's standard library.
 
+### FreeBSD system users
+
+With `-pw /usr/sbin/pw`, Dovecot's auth service verifies the current
+password over its auth-client socket (`-auth-socket`, default
+`/var/run/dovecot/auth-client`), through whatever passdb Dovecot signs
+in with, PAM usually; `-auth-service` (default `imap`) is the protocol
+the passdb sees. `pw usermod -n <user> -h 0` then sets the new one, read
+from standard input and hashed as the user's login class says. Neither
+password nor hash appears on a command line, and no setuid helper runs.
+
+- pw needs root, so the service runs as root. Listen on a Unix socket in
+  a directory of alborz's group (`-listen unix:/var/run/alborz-passwd/sock`,
+  the directory `root:alborz 0750`) with umask 007: a new socket takes
+  its directory's group.
+- alborz sends the local part (`?user=local`), as PAM names the users.
+- Any account Dovecot's passdb takes can be changed, root's too where
+  PAM lets root sign in to Dovecot; deny such accounts in the passdb.
+- The current password is checked again just before pw runs, but pw
+  has its own lock and a change made in between is overwritten.
+- Only the local password database changes; a PAM stack that
+  authenticates elsewhere (LDAP, Kerberos) is not written.
+- OpenBSD's and NetBSD's tools (`usermod -p`, `chpass -a`) take the new
+  hash as an argument, which other local users can read in `ps`, so
+  they are not supported.
+
 ## Install
 
     go build -o /usr/local/sbin/alborz-passwd .   # -tags pgsql, mysql or sqlite for -sql
@@ -85,9 +111,10 @@ The unit serves a passwd-file. For `-sql`, give the unit `-sql` in
 and a database reached over TCP needs `PrivateNetwork`,
 `RestrictAddressFamilies` and `IPAddressDeny` loosened.
 
-Flags: `-passwd-file` or `-sql` (one is required), `-scheme` (new hashes, default
-`SHA512-CRYPT`), `-default-scheme` (for hashes without a `{SCHEME}`
-prefix, default `CRYPT`), `-min-length` (default 8), `-doveadm`,
+Flags: `-passwd-file`, `-sql` or `-pw` (one is required), `-scheme`
+(new hashes, default `SHA512-CRYPT`), `-default-scheme` (for hashes
+without a `{SCHEME}` prefix, default `CRYPT`), `-min-length` (default
+8), `-doveadm`, `-auth-socket` and `-auth-service` (for `-pw`),
 `-listen` (`unix:/path` or a loopback `host:port`; unset takes the
 socket systemd passes).
 
@@ -110,6 +137,11 @@ socket systemd passes).
 ## Test
 
     go test ./...
+    # Dovecot's auth service, in the dovecot/dovecot image (static passdb):
+    GOOS=linux go test -c -o passwd.test . && docker run -d --name dc \
+        -e USER_PASSWORD=secret dovecot/dovecot:2.4.5 && docker cp passwd.test dc:/t &&
+      docker exec -e AUTH_SOCKET=/run/dovecot/auth-client -e AUTH_USER=alice \
+        -e AUTH_PASSWORD=secret dc /t -test.v -test.run DovecotAuth
     # SQL: SQLite in process, PostgreSQL and MySQL where a DSN is given:
     PGSQL_DSN=postgres://... MYSQL_DSN='user:pw@tcp(127.0.0.1:3306)/db' \
       go test -tags pgsql,mysql,sqlite ./...
