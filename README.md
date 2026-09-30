@@ -39,19 +39,23 @@ only, since it holds the database password:
     # pgsql (PostgreSQL), mysql (MySQL, MariaDB) or sqlite
     driver = pgsql
     dsn = host=/run/postgresql dbname=mail user=passwd
-    select = SELECT password FROM users WHERE userid = %n AND domain = %d FOR UPDATE
-    update = UPDATE users SET password = %p WHERE userid = %n AND domain = %d
+    select = SELECT password FROM users WHERE userid = '%{user | username}' AND domain = '%{user | domain}' FOR UPDATE
+    update = UPDATE users SET password = '%{hash}' WHERE userid = '%{user | username}' AND domain = '%{user | domain}'
 
 - `select` returns one row: none is an unknown user, two are an error.
   The hash is the column named `password`, as in Dovecot's
   `password_query`, and other columns are ignored. A hash without a
   `{SCHEME}` prefix takes `-default-scheme`, and one in a column named
   `password_noscheme` always does.
-- The variables are bound as parameters, never pasted into the SQL, so
-  they stand unquoted: `%u` the user as alborz sends it
-  (`%{user}` in Dovecot 2.4), `%n` its local part (`%{user|username}`),
-  `%d` its domain (`%{user|domain}`), and `%p`, in `update` only, the new
-  hash with its `{SCHEME}` prefix. No other `%` is taken.
+- The variables are Dovecot's, in 2.3's or 2.4's syntax: `%u` or
+  `%{user}` the user as alborz sends it, `%n` or `%{user | username}`
+  its local part, `%d` or `%{user | domain}` its domain, the filters
+  `lower` and `upper` (`%Lu`), `%%` a percent sign, and, in `update`
+  only, `%p` or `%{hash}` the new hash with its `{SCHEME}` prefix. They
+  are bound as parameters, never pasted into the SQL; a quoted literal
+  holding them is bound whole, so Dovecot's `'%n'` and
+  `'/var/vmail/%d/%n'` work as written. A query copied from Dovecot
+  needs only `FOR UPDATE`.
 - The select, the check of the current password and the update run in
   one transaction; an update changing anything but one row is rolled
   back. `FOR UPDATE` keeps another writer out in between on PostgreSQL

@@ -13,24 +13,50 @@ import (
 )
 
 func TestParseQuery(t *testing.T) {
-	q, err := ParseQuery("UPDATE u SET p = %p WHERE n = %n AND d = %d OR u = %u", drivers["pgsql"].bind)
+	for _, c := range []struct{ query, text, args string }{
+		{"UPDATE u SET p = %p WHERE n = %n AND d = %d OR u = %u",
+			"UPDATE u SET p = $1 WHERE n = $2 AND d = $3 OR u = $4", "[{X}h Alice Example.org Alice@Example.org]"},
+		{"WHERE n = '%n' AND d = \"%d\" AND a = 'Y'",
+			"WHERE n = $1 AND d = $2 AND a = 'Y'", "[Alice Example.org]"},
+		{"WHERE n = '%{user | username}' AND d = '%{user|domain|lower}' AND u = %{user}",
+			"WHERE n = $1 AND d = $2 AND u = $3", "[Alice example.org Alice@Example.org]"},
+		{"WHERE u = '%Lu' AND n = %Un AND d = %{domain} AND h = %{hash}",
+			"WHERE u = $1 AND n = $2 AND d = $3 AND h = $4", "[alice@example.org ALICE Example.org {X}h]"},
+		{"SELECT '/var/vmail/%d/%n' AS home, 'it''s %n' AS s, 7 %% 2 WHERE u LIKE '%%%u'",
+			"SELECT $1 AS home, $2 AS s, 7 % 2 WHERE u LIKE $3", "[/var/vmail/Example.org/Alice it's Alice %Alice@Example.org]"},
+	} {
+		q, err := ParseQuery(c.query, drivers["pgsql"].bind)
+		if err != nil {
+			t.Errorf("%q: %v", c.query, err)
+			continue
+		}
+		if q.text != c.text {
+			t.Errorf("%q: %q, want %q", c.query, q.text, c.text)
+		}
+		if got := fmt.Sprint(q.args("Alice@Example.org", "{X}h")); got != c.args {
+			t.Errorf("%q: args %s, want %s", c.query, got, c.args)
+		}
+	}
+	if got := fmt.Sprint(mustParse(t, "%u %n %{user|domain}").args("alice", "")); got != "[alice alice ]" {
+		t.Errorf("args of a user without a domain: %s", got)
+	}
+	for _, bad := range []string{"WHERE u = %w", "LIKE 'a%'", "WHERE u = %", "WHERE u = '%u", "%{user",
+		"%{user|substr(0,3)}", "%{hash|lower}", "%{home}", "%Lp", "%Xu"} {
+		if _, err := ParseQuery(bad, drivers["mysql"].bind); err == nil {
+			t.Errorf("%q parsed", bad)
+		} else {
+			t.Logf("%q: %v", bad, err)
+		}
+	}
+}
+
+func mustParse(t *testing.T, query string) Query {
+	t.Helper()
+	q, err := ParseQuery(query, drivers["sqlite"].bind)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "UPDATE u SET p = $1 WHERE n = $2 AND d = $3 OR u = $4"; q.text != want {
-		t.Errorf("%q, want %q", q.text, want)
-	}
-	if got, want := fmt.Sprint(q.args("alice@example.org", "{X}h")), "[{X}h alice example.org alice@example.org]"; got != want {
-		t.Errorf("args %s, want %s", got, want)
-	}
-	if got := fmt.Sprint(q.args("alice", "{X}h")); got != "[{X}h alice  alice]" {
-		t.Errorf("args of a user without a domain: %s", got)
-	}
-	for _, bad := range []string{"WHERE u = %w", "LIKE 'a%'", "WHERE u = %"} {
-		if _, err := ParseQuery(bad, drivers["mysql"].bind); err == nil {
-			t.Errorf("%q parsed", bad)
-		}
-	}
+	return q
 }
 
 // testDB is a database the SQL tests run against, emptied for each.
@@ -86,7 +112,7 @@ func openSQL(t *testing.T, db testDB, sel, update string) (*SQL, *sql.DB, error)
 	t.Cleanup(func() { conn.Close() })
 	for _, stmt := range []string{
 		"DROP TABLE IF EXISTS users",
-		"CREATE TABLE users (name VARCHAR(64), domain VARCHAR(64), password VARCHAR(255) NOT NULL, PRIMARY KEY (name, domain))",
+		"CREATE TABLE users (username VARCHAR(64), domain VARCHAR(64), password VARCHAR(255) NOT NULL, PRIMARY KEY (username, domain))",
 	} {
 		if _, err := conn.Exec(stmt); err != nil {
 			t.Fatal(err)
@@ -110,7 +136,7 @@ func openSQL(t *testing.T, db testDB, sel, update string) (*SQL, *sql.DB, error)
 
 func stored(t *testing.T, conn *sql.DB) [][3]string {
 	t.Helper()
-	rs, err := conn.Query("SELECT name, domain, password FROM users ORDER BY domain, name")
+	rs, err := conn.Query("SELECT username, domain, password FROM users ORDER BY domain, username")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,8 +156,8 @@ func stored(t *testing.T, conn *sql.DB) [][3]string {
 }
 
 const (
-	oneSelect = "SELECT password FROM users WHERE name = %n AND domain = %d"
-	oneUpdate = "UPDATE users SET password = %p WHERE name = %n AND domain = %d"
+	oneSelect = "SELECT password FROM users WHERE username = %n AND domain = %d"
+	oneUpdate = "UPDATE users SET password = %p WHERE username = %n AND domain = %d"
 )
 
 func TestSQLChange(t *testing.T) {
@@ -170,7 +196,7 @@ func TestSQLRefusalsChangeNothing(t *testing.T) {
 			}{
 				{"wrong password", oneUpdate, "alice@example.org", "wrong", "500 Old password is incorrect"},
 				{"unknown user", oneUpdate, "carol@example.org", "wrong", "500 Old password is incorrect"},
-				{"two rows", "UPDATE users SET password = %p WHERE name = %n", "alice@example.org", "old-secret",
+				{"two rows", "UPDATE users SET password = %p WHERE username = %n", "alice@example.org", "old-secret",
 					"500 Server error, password not changed"},
 			} {
 				s, conn := setupSQL(t, db, oneSelect, c.update)
@@ -221,11 +247,11 @@ func TestSQLSelectColumns(t *testing.T) {
 				name, sel, user, old string
 				ok                   bool
 			}{
-				{"extra fields", "SELECT name AS username, password, domain AS userdb_home FROM users WHERE name = %n AND domain = %d",
+				{"extra fields", "SELECT username AS user, password, domain AS userdb_home FROM users WHERE username = %n AND domain = %d",
 					"alice@example.org", "old-secret", true},
-				{"password_noscheme of a bare hash", "SELECT domain, password AS password_noscheme FROM users WHERE name = %n AND domain = %d",
+				{"password_noscheme of a bare hash", "SELECT domain, password AS password_noscheme FROM users WHERE username = %n AND domain = %d",
 					"bob@example.org", "bobs", true},
-				{"password_noscheme of a prefixed hash", "SELECT domain, password AS password_noscheme FROM users WHERE name = %n AND domain = %d",
+				{"password_noscheme of a prefixed hash", "SELECT domain, password AS password_noscheme FROM users WHERE username = %n AND domain = %d",
 					"alice@example.org", "old-secret", false},
 			} {
 				s, conn := setupSQL(t, db, c.sel, oneUpdate)
@@ -238,15 +264,44 @@ func TestSQLSelectColumns(t *testing.T) {
 				}
 			}
 			for name, sel := range map[string]string{
-				"no password":                   "SELECT name, domain FROM users WHERE name = %n AND domain = %d",
-				"two passwords":                 "SELECT password, password AS password_noscheme FROM users WHERE name = %n AND domain = %d",
-				"a lone column of another name": "SELECT password AS pw FROM users WHERE name = %n AND domain = %d",
-				"another case":                  "SELECT domain, password AS \"Password\" FROM users WHERE name = %n AND domain = %d",
+				"no password":                   "SELECT username, domain FROM users WHERE username = %n AND domain = %d",
+				"two passwords":                 "SELECT password, password AS password_noscheme FROM users WHERE username = %n AND domain = %d",
+				"a lone column of another name": "SELECT password AS pw FROM users WHERE username = %n AND domain = %d",
+				"another case":                  "SELECT domain, password AS \"Password\" FROM users WHERE username = %n AND domain = %d",
 			} {
 				if _, _, err := openSQL(t, db, sel, oneUpdate); err == nil {
 					t.Errorf("%s: taken", name)
 				} else {
 					t.Logf("%s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+// TestSQLDovecotQueries takes queries as a dovecot-sql.conf.ext or 2.4's passdb sql writes them.
+func TestSQLDovecotQueries(t *testing.T) {
+	for _, db := range testDBs(t) {
+		t.Run(db.driver, func(t *testing.T) {
+			for _, c := range []struct{ name, sel, update, user string }{
+				{"2.3", "SELECT username, domain, password FROM users WHERE username = '%n' AND domain = '%d'",
+					"UPDATE users SET password = '%p' WHERE username = '%n' AND domain = '%d'", "alice@example.org"},
+				{"2.4", "SELECT username, domain, password, '/var/vmail/%{user | domain}/%{user | username}' AS userdb_home " +
+					"FROM users WHERE username = '%{user | username}' AND domain = '%{user | domain}'",
+					"UPDATE users SET password = '%p' WHERE username = '%{user | username}' AND domain = '%{user | domain}'",
+					"alice@example.org"},
+				{"lower", "SELECT password FROM users WHERE username = '%{user | username | lower}' AND domain = '%{user | domain | lower}'",
+					"UPDATE users SET password = %p WHERE username = '%Ln' AND domain = '%Ld'", "Alice@Example.ORG"},
+			} {
+				s, conn := setupSQL(t, db, c.sel, c.update)
+				before := stored(t, conn)
+				if !changed(t, s, c.user, "old-secret") {
+					t.Errorf("%s: not changed", c.name)
+				}
+				want := slices.Clone(before)
+				want[1][2] = hashed("fresh secret")
+				if after := stored(t, conn); !slices.Equal(after, want) {
+					t.Errorf("%s: rows %q, want %q", c.name, after, want)
 				}
 			}
 		})

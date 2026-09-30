@@ -36,43 +36,176 @@ type SQL struct {
 	DefaultScheme string
 }
 
-// A Query is SQL with Dovecot's variables bound as parameters: %u the user, %n its local part,
-// %d its domain, and %p the new password's hash.
+// A Query is SQL with Dovecot's variables bound as parameters. A quoted literal holding
+// variables, as Dovecot's queries quote them, is bound whole: '%n@%d' is one parameter.
 type Query struct {
-	text string
-	vars []byte
+	text   string
+	params [][]part
+}
+
+// A part of a parameter is text, or a variable (user, or hash, the new password's) through
+// its filters.
+type part struct {
+	text    string
+	name    string
+	filters []string
+}
+
+// short are Dovecot 2.3's variables in 2.4's syntax.
+var short = map[byte]string{'u': "user", 'n': "user|username", 'd': "user|domain", 'p': "hash"}
+
+// long are the names %{...} takes: 2.4's user, 2.3's username and domain, and hash.
+var long = map[string]string{"user": "user", "username": "user|username", "domain": "user|domain",
+	"hash": "hash"}
+
+// modifiers are Dovecot 2.3's, as in %Lu.
+var modifiers = map[byte]string{'L': "|lower", 'U': "|upper"}
+
+// filters are Dovecot 2.4's, each with the variable it takes.
+var filters = map[string]struct {
+	of string
+	fn func(string) string
+}{
+	"username": {"user", func(s string) string { name, _, _ := strings.Cut(s, "@"); return name }},
+	"domain":   {"user", func(s string) string { _, domain, _ := strings.Cut(s, "@"); return domain }},
+	"lower":    {"user", strings.ToLower},
+	"upper":    {"user", strings.ToUpper},
 }
 
 func ParseQuery(query string, bind func(i int) string) (Query, error) {
 	var q Query
 	var b strings.Builder
-	for i := 0; i < len(query); i++ {
-		if query[i] != '%' {
-			b.WriteByte(query[i])
-			continue
+	for i := 0; i < len(query); {
+		var parts []part
+		n := 1
+		var err error
+		switch c := query[i]; {
+		case c == '\'' || c == '"':
+			if n, err = quoted(query[i:]); err == nil && strings.Contains(query[i:i+n], "%") {
+				parts, err = template(strings.ReplaceAll(query[i+1:i+n-1], string(c)+string(c), string(c)))
+			}
+		case c == '%':
+			var p part
+			p, n, err = variable(query[i:])
+			parts = []part{p}
 		}
-		if i++; i == len(query) || !strings.ContainsRune("undp", rune(query[i])) {
-			return Query{}, fmt.Errorf("%q: the variables are %%u, %%n, %%d and %%p", query)
+		switch {
+		case err != nil:
+			return Query{}, fmt.Errorf("%q: %v", query, err)
+		case parts == nil:
+			b.WriteString(query[i : i+n])
+		case len(parts) == 1 && parts[0].name == "":
+			b.WriteString(parts[0].text)
+		default:
+			q.params = append(q.params, parts)
+			b.WriteString(bind(len(q.params)))
 		}
-		q.vars = append(q.vars, query[i])
-		b.WriteString(bind(len(q.vars)))
+		i += n
 	}
 	q.text = b.String()
 	return q, nil
 }
 
+// quoted is the length of the literal s starts with, whose quote a doubled one escapes.
+func quoted(s string) (int, error) {
+	for i := 1; i < len(s); i++ {
+		if s[i] != s[0] {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == s[0] {
+			i++
+			continue
+		}
+		return i + 1, nil
+	}
+	return 0, errors.New("a quote is not closed")
+}
+
+func template(s string) ([]part, error) {
+	var parts []part
+	for len(s) > 0 {
+		i := strings.IndexByte(s, '%')
+		if i < 0 {
+			return append(parts, part{text: s}), nil
+		}
+		p, n, err := variable(s[i:])
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, part{text: s[:i]}, p)
+		s = s[i+n:]
+	}
+	return parts, nil
+}
+
+// variable reads the one s starts with, in 2.3's or 2.4's syntax, and its length; %% is text.
+func variable(s string) (part, int, error) {
+	switch {
+	case strings.HasPrefix(s, "%%"):
+		return part{text: "%"}, 2, nil
+	case strings.HasPrefix(s, "%{"):
+		end := strings.IndexByte(s, '}')
+		if end < 0 {
+			return part{}, 0, fmt.Errorf("%s: no closing }", s)
+		}
+		p, err := expand(s[2:end])
+		return p, end + 1, err
+	case len(s) > 2 && modifiers[s[1]] != "" && short[s[2]] != "":
+		p, err := expand(short[s[2]] + modifiers[s[1]])
+		return p, 3, err
+	case len(s) > 1 && short[s[1]] != "":
+		p, err := expand(short[s[1]])
+		return p, 2, err
+	}
+	return part{}, 0, fmt.Errorf("%.3s: the variables are %%u, %%n, %%d, %%p and %%{user|filter}", s)
+}
+
+// expand reads a name and its filters, as in user | username | lower.
+func expand(expr string) (part, error) {
+	name, rest, _ := strings.Cut(expr, "|")
+	full, ok := long[strings.TrimSpace(name)]
+	if !ok {
+		return part{}, fmt.Errorf("%%{%s}: no variable %q", expr, strings.TrimSpace(name))
+	}
+	fs := strings.Split(full, "|")
+	if rest != "" {
+		fs = append(fs, strings.Split(rest, "|")...)
+	}
+	p := part{name: fs[0]}
+	for _, f := range fs[1:] {
+		f = strings.TrimSpace(f)
+		if filters[f].of != p.name {
+			return part{}, fmt.Errorf("%%{%s}: %s takes no filter %q", expr, p.name, f)
+		}
+		p.filters = append(p.filters, f)
+	}
+	return p, nil
+}
+
 func (q Query) args(user, hash string) []any {
-	name, domain, _ := strings.Cut(user, "@")
-	values := map[byte]string{'u': user, 'n': name, 'd': domain, 'p': hash}
-	args := make([]any, len(q.vars))
-	for i, v := range q.vars {
-		args[i] = values[v]
+	values := map[string]string{"user": user, "hash": hash}
+	args := make([]any, len(q.params))
+	for i, parts := range q.params {
+		var b strings.Builder
+		for _, p := range parts {
+			v := p.text
+			if p.name != "" {
+				v = values[p.name]
+			}
+			for _, f := range p.filters {
+				v = filters[f].fn(v)
+			}
+			b.WriteString(v)
+		}
+		args[i] = b.String()
 	}
 	return args
 }
 
-func (q Query) has(vars string) bool {
-	return slices.ContainsFunc(q.vars, func(v byte) bool { return strings.IndexByte(vars, v) >= 0 })
+func (q Query) uses(name string) bool {
+	return slices.ContainsFunc(q.params, func(parts []part) bool {
+		return slices.ContainsFunc(parts, func(p part) bool { return p.name == name })
+	})
 }
 
 // OpenSQL reads a file of driver, dsn, select and update lines, each "key = value", and
@@ -93,11 +226,11 @@ func OpenSQL(path string, h Hasher, defaultScheme string) (*SQL, error) {
 	if s.Update, err = ParseQuery(conf["update"], driver.bind); err != nil {
 		return nil, err
 	}
-	if !s.Select.has("und") || s.Select.has("p") {
-		return nil, errors.New("select: name the user with %u, %n or %d, and no %p")
+	if !s.Select.uses("user") || s.Select.uses("hash") {
+		return nil, errors.New("select: name the user, as %u or %{user}, and not the hash")
 	}
-	if !s.Update.has("und") || !s.Update.has("p") {
-		return nil, errors.New("update: name the user with %u, %n or %d, and the hash with %p")
+	if !s.Update.uses("user") || !s.Update.uses("hash") {
+		return nil, errors.New("update: name the user, as %u or %{user}, and the hash, as %p")
 	}
 	if !slices.Contains(sql.Drivers(), driver.name) {
 		return nil, fmt.Errorf("driver %q is not built in: build with -tags %s", conf["driver"], conf["driver"])
