@@ -107,16 +107,53 @@ func OpenSQL(path string, h Hasher, defaultScheme string) (*SQL, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sqlTimeout)
 	defer cancel()
-	// Preparing the queries finds a misspelt table or column before the first reader does.
-	for name, q := range map[string]Query{"select": s.Select, "update": s.Update} {
-		stmt, err := s.DB.PrepareContext(ctx, q.text)
-		if err != nil {
-			s.DB.Close()
-			return nil, fmt.Errorf("%s: %v", name, err)
-		}
-		stmt.Close()
+	// Running the select and preparing the update find a misspelt table or column, and a
+	// select without the password among its columns, before the first reader does.
+	if err := s.check(ctx); err != nil {
+		s.DB.Close()
+		return nil, err
 	}
 	return s, nil
+}
+
+func (s *SQL) check(ctx context.Context) error {
+	rows, err := s.DB.QueryContext(ctx, s.Select.text, s.Select.args("", "")...)
+	if err != nil {
+		return fmt.Errorf("select: %v", err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return fmt.Errorf("select: %v", err)
+	}
+	if _, _, err := passwordColumn(cols); err != nil {
+		return err
+	}
+	stmt, err := s.DB.PrepareContext(ctx, s.Update.text)
+	if err != nil {
+		return fmt.Errorf("update: %v", err)
+	}
+	return stmt.Close()
+}
+
+// passwordColumn finds the hash among the select's columns by Dovecot's names: password, or
+// password_noscheme, whose value never carries a {SCHEME} prefix.
+func passwordColumn(cols []string) (i int, noscheme bool, err error) {
+	i = -1
+	for j, c := range cols {
+		if c != "password" && c != "password_noscheme" {
+			continue
+		}
+		if i >= 0 {
+			return 0, false, fmt.Errorf("select: both %s and %s", cols[i], c)
+		}
+		i, noscheme = j, c == "password_noscheme"
+	}
+	if i >= 0 {
+		return i, noscheme, nil
+	}
+	return 0, false, fmt.Errorf("select: none of the columns %s is password or password_noscheme",
+		strings.Join(cols, ", "))
 }
 
 // readConf reads "key = value" lines, blank lines and # comments, each of keys once.
@@ -171,12 +208,29 @@ func (s *SQL) hash(ctx context.Context, q querier, user string) (string, error) 
 		}
 		return "", sql.ErrNoRows
 	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return "", err
+	}
+	i, noscheme, err := passwordColumn(cols)
+	if err != nil {
+		return "", err
+	}
+	// Dovecot takes the other columns as extra fields; here they are read and left.
+	dest := make([]any, len(cols))
+	for j := range dest {
+		dest[j] = new(any)
+	}
 	var hash string
-	if err := rows.Scan(&hash); err != nil {
+	dest[i] = &hash
+	if err := rows.Scan(dest...); err != nil {
 		return "", fmt.Errorf("select: %v", err)
 	}
 	if rows.Next() {
 		return "", fmt.Errorf("select: more than one row for %s", user)
+	}
+	if noscheme {
+		return "{" + s.DefaultScheme + "}" + hash, rows.Err()
 	}
 	return prefixed(hash, s.DefaultScheme), rows.Err()
 }

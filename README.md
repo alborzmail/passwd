@@ -42,9 +42,11 @@ only, since it holds the database password:
     select = SELECT password FROM users WHERE userid = %n AND domain = %d FOR UPDATE
     update = UPDATE users SET password = %p WHERE userid = %n AND domain = %d
 
-- `select` returns the one column holding the user's hash, in one row;
-  none is an unknown user, two are an error. A hash without a `{SCHEME}`
-  prefix takes `-default-scheme`.
+- `select` returns one row: none is an unknown user, two are an error.
+  The hash is the column named `password`, as in Dovecot's
+  `password_query`, and other columns are ignored. A hash without a
+  `{SCHEME}` prefix takes `-default-scheme`, and one in a column named
+  `password_noscheme` always does.
 - The variables are bound as parameters, never pasted into the SQL, so
   they stand unquoted: `%u` the user as alborz sends it
   (`%{user}` in Dovecot 2.4), `%n` its local part (`%{user|username}`),

@@ -64,8 +64,20 @@ var rows = [][3]string{
 	{"alice", "example.net", hashed("other")},
 }
 
-// setupSQL fills db with rows and serves it with the update given.
-func setupSQL(t *testing.T, db testDB, update string) (*Server, *sql.DB) {
+// setupSQL fills db with rows and serves it with the queries given.
+func setupSQL(t *testing.T, db testDB, sel, update string) (*Server, *sql.DB) {
+	t.Helper()
+	backend, conn, err := openSQL(t, db, sel, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.DB.Close() })
+	return &Server{Backend: backend, Limit: NewLimiter(failedTries, failedWindow), MinLength: 8,
+		Log: log.New(io.Discard, "", 0)}, conn
+}
+
+// openSQL fills db with rows and opens it with the queries given, sel without its lock.
+func openSQL(t *testing.T, db testDB, sel, update string) (*SQL, *sql.DB, error) {
 	t.Helper()
 	conn, err := sql.Open(drivers[db.driver].name, db.dsn)
 	if err != nil {
@@ -87,18 +99,13 @@ func setupSQL(t *testing.T, db testDB, update string) (*Server, *sql.DB) {
 		}
 	}
 	path := filepath.Join(t.TempDir(), "sql.conf")
-	conf := fmt.Sprintf("# the users table\ndriver = %s\ndsn = %s\n\nselect = SELECT password FROM users WHERE name = %%n AND domain = %%d%s\nupdate = %s\n",
-		db.driver, db.dsn, db.lock, update)
+	conf := fmt.Sprintf("# the users table\ndriver = %s\ndsn = %s\n\nselect = %s%s\nupdate = %s\n",
+		db.driver, db.dsn, sel, db.lock, update)
 	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	backend, err := OpenSQL(path, testHasher{}, "TEST")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { backend.DB.Close() })
-	return &Server{Backend: backend, Limit: NewLimiter(failedTries, failedWindow), MinLength: 8,
-		Log: log.New(io.Discard, "", 0)}, conn
+	return backend, conn, err
 }
 
 func stored(t *testing.T, conn *sql.DB) [][3]string {
@@ -122,7 +129,10 @@ func stored(t *testing.T, conn *sql.DB) [][3]string {
 	return out
 }
 
-const oneUpdate = "UPDATE users SET password = %p WHERE name = %n AND domain = %d"
+const (
+	oneSelect = "SELECT password FROM users WHERE name = %n AND domain = %d"
+	oneUpdate = "UPDATE users SET password = %p WHERE name = %n AND domain = %d"
+)
 
 func TestSQLChange(t *testing.T) {
 	for _, db := range testDBs(t) {
@@ -131,7 +141,7 @@ func TestSQLChange(t *testing.T) {
 				{"alice@example.org", "old-secret"},
 				{"bob@example.org", "bobs"},
 			} {
-				s, conn := setupSQL(t, db, oneUpdate)
+				s, conn := setupSQL(t, db, oneSelect, oneUpdate)
 				before := stored(t, conn)
 				got := converse(t, s, "user "+c.user, "pass "+c.old, "newpass fresh secret", "quit")
 				if got[len(got)-1] != "200 Bye" {
@@ -163,7 +173,7 @@ func TestSQLRefusalsChangeNothing(t *testing.T) {
 				{"two rows", "UPDATE users SET password = %p WHERE name = %n", "alice@example.org", "old-secret",
 					"500 Server error, password not changed"},
 			} {
-				s, conn := setupSQL(t, db, c.update)
+				s, conn := setupSQL(t, db, oneSelect, c.update)
 				before := stored(t, conn)
 				got := converse(t, s, "user "+c.user, "pass "+c.old, "newpass fresh secret")
 				if got[len(got)-1] != c.last {
@@ -194,5 +204,51 @@ func TestSQLConfRefused(t *testing.T) {
 		} else {
 			t.Logf("%s: %v", name, err)
 		}
+	}
+}
+
+// changed runs a change for user and reports whether the server took it.
+func changed(t *testing.T, s *Server, user, old string) bool {
+	t.Helper()
+	got := converse(t, s, "user "+user, "pass "+old, "newpass fresh secret", "quit")
+	return got[len(got)-1] == "200 Bye"
+}
+
+func TestSQLSelectColumns(t *testing.T) {
+	for _, db := range testDBs(t) {
+		t.Run(db.driver, func(t *testing.T) {
+			for _, c := range []struct {
+				name, sel, user, old string
+				ok                   bool
+			}{
+				{"extra fields", "SELECT name AS username, password, domain AS userdb_home FROM users WHERE name = %n AND domain = %d",
+					"alice@example.org", "old-secret", true},
+				{"password_noscheme of a bare hash", "SELECT domain, password AS password_noscheme FROM users WHERE name = %n AND domain = %d",
+					"bob@example.org", "bobs", true},
+				{"password_noscheme of a prefixed hash", "SELECT domain, password AS password_noscheme FROM users WHERE name = %n AND domain = %d",
+					"alice@example.org", "old-secret", false},
+			} {
+				s, conn := setupSQL(t, db, c.sel, oneUpdate)
+				before := stored(t, conn)
+				if got := changed(t, s, c.user, c.old); got != c.ok {
+					t.Errorf("%s: changed %v, want %v", c.name, got, c.ok)
+				}
+				if after := stored(t, conn); slices.Equal(after, before) == c.ok {
+					t.Errorf("%s: rows %q after %q", c.name, after, before)
+				}
+			}
+			for name, sel := range map[string]string{
+				"no password":                   "SELECT name, domain FROM users WHERE name = %n AND domain = %d",
+				"two passwords":                 "SELECT password, password AS password_noscheme FROM users WHERE name = %n AND domain = %d",
+				"a lone column of another name": "SELECT password AS pw FROM users WHERE name = %n AND domain = %d",
+				"another case":                  "SELECT domain, password AS \"Password\" FROM users WHERE name = %n AND domain = %d",
+			} {
+				if _, _, err := openSQL(t, db, sel, oneUpdate); err == nil {
+					t.Errorf("%s: taken", name)
+				} else {
+					t.Logf("%s: %v", name, err)
+				}
+			}
+		})
 	}
 }
